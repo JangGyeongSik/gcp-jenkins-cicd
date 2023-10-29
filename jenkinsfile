@@ -1,0 +1,424 @@
+// #######################################################
+// Jenkinsfile Script
+// Title    : How to deploy GCP VMs via Jenkins' CI/CD
+// Auther   : by GyeongSik, Jang
+// Created  : 2023-10-29
+// Modified : 2023-10-29
+// E-mail   : kqkdn1@gmail.com
+// #######################################################
+
+// Import 구문 위치
+import groovy.json.JsonOutput
+
+pipeline {
+    agent any
+    // Import groovy 
+    environment {
+        PROJECT_ID = '$PROJECT_ID'
+        PROD_PROJECT_NAME = 'PROD_PROJECT'
+        DEV_PROJECT_NAME = 'DEV_PROJECT'
+        REGION = 'asia-northeast3' 
+        PROD_INSTANCE_GROUP_NAME = 'PROD_MIG'
+        DEV_INSTANCE_GROUP_NAME = 'DEV_MIG'
+        STG_INSTANCE_GROUP_NAME = 'STG_MIG'
+    }
+    parameters {
+        string(name: 'PROD_TEMPLATE_BASE_NAME', defaultValue: "PROD_TEMPLATE", description: 'Prod Base Instance Template Name')
+        string(name: 'STG_TEMPLATE_BASE_NAME', defaultValue: "STG_TEMPLATE", description: 'Stg Base Instance Template Name')
+        string(name: 'DEV_TEMPLATE_BASE_NAME', defaultValue: "DEV_TEMPLATE", description: 'Dev Base Instance Template Name')
+        string(name: 'MACHINE_TYPE', defaultValue: "e2-standard-2", description: 'Base Machine Type')
+        string(name: 'SERVICE_LABEL', defaultValue: "app_name=union,env=dev,source_repo=gce-jenkins-cicd,type=api")
+        string(name: 'SERVICE_TP_ACCOUNT', defaultValue: "SERVICE_ACCOUNT_EMAIL")
+        string(name: 'VPC_SUBNET', defaultValue: "VPC_SUBNET_NAME")
+        string(name: 'VPC_FIRWALL_TAG', defaultValue: "FW_TAG_1,FW_TAG_2")
+        string(name: 'IMAGE_FAMILY', defaultValue: "IMAGE_FAMILY_NAME")
+    }
+    stages {
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+        stage('Packer Build') {
+            when {
+                // 커밋 메시지에 "rollback"이 포함되어 있지 않을 때만 실행
+                expression { 
+                    def commitMessage = sh(script: 'git log --format=%B -n 1', returnStdout: true).trim().toLowerCase()
+                    return !commitMessage.contains('rollback')
+                }
+            }
+            steps {
+                script {
+                    try {
+                        echo 'Building the Application...'
+                        // Simulate a successful build
+                        sh '''pwd;
+                            packer build template.json
+                        '''
+                        echo 'Build the Application with Packer Successs....'
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("Build failed: ${e.getMessage()}")
+                    }
+                }
+            }
+        }
+        stage('Create Instance Template') {
+            when {
+                // 커밋 메시지에 "rollback"이 포함되어 있지 않을 때만 실행
+                expression { 
+                    def commitMessage = sh(script: 'git log --format=%B -n 1', returnStdout: true).trim().toLowerCase()
+                    return !commitMessage.contains('rollback')
+                }
+            }
+            steps {
+                script {
+                    def imageId = sh(script: "gcloud compute images list --format 'value(name)' --filter='family=${params.IMAGE_FAMILY}'", returnStdout: true).trim()
+                    def timestamp = new Date().format("yyyyMMddHHmmss")
+                    def prodtemplateName = "${params.PROD_TEMPLATE_BASE_NAME}-${timestamp}"
+                    def devtemplateName = "${params.DEV_TEMPLATE_BASE_NAME}-${timestamp}"
+                    def projectId = "$PROJECT_ID"
+                    // Python App Build를 위한 Startup Script
+                    def metadataStartupScript = '''
+                        #!/bin/bash
+                        sudo pip3 install -r requirements.txt
+                        nohup /usr/bin/gunicorn --bind 0.0.0.0:80 app:app --daemon &
+                    '''
+                    def setProjectId= """
+                        gcloud config set project ${env.PROJECT_ID}
+                    """
+                    def createTemplateCmd = """
+                        gcloud compute instance-templates create ${devtemplateName} \\
+                            --project=${env.PROJECT_ID} \\
+                            --machine-type=${params.MACHINE_TYPE} \\
+                            --network-interface=nic-type=GVNIC,subnet=${params.VPC_SUBNET} \\
+                            --metadata=enable-oslogin=true,startup-script='${metadataStartupScript}' \\
+                            --maintenance-policy=MIGRATE \\
+                            --provisioning-model=STANDARD \\
+                            --service-account=${params.SERVICE_TP_ACCOUNT} \\
+                            --scopes=https://www.googleapis.com/auth/cloud-platform \\
+                            --region=${env.REGION} \\
+                            --tags=${params.VPC_FIRWALL_TAG} \\
+                            --create-disk=auto-delete=yes,boot=yes,device-name=dev-device-demo-${timestamp},image-family=projects/${env.PROJECT_ID}/global/images/family/${params.IMAGE_FAMILY},mode=rw,size=50,type=pd-balanced \\
+                            --no-address \\
+                            --no-shielded-secure-boot \\
+                            --shielded-vtpm \\
+                            --shielded-integrity-monitoring \\
+                            --labels="${params.SERVICE_LABEL}" \\
+                            --reservation-affinity=any
+                    """
+                    try {
+                        echo 'Create Instance Template......'
+                        // Google Coud Config Set Project ID 
+                        gcloudConfigSetProject(env.PROJECT_ID)
+                        // Creating a GCP Instance Template based on the baked image
+                        sh createTemplateCmd
+                        echo 'Template Create Success....'
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("Build failed: ${e.getMessage()}")
+                        }
+                    }
+                }
+            }
+        stage('Send Approval Request') {
+            when {
+                // 커밋 메시지에 "rollback"이 포함되어 있지 않을 때만 실행
+                expression { 
+                    def commitMessage = sh(script: 'git log --format=%B -n 1', returnStdout: true).trim().toLowerCase()
+                    return !commitMessage.contains('rollback')
+                }
+            }
+            steps {
+                script {
+                    currentBuild.description = "Please review the deployment plan and provide your approval."
+                    sendTeamsApprovalAndProcess(currentBuild.description)
+                }
+            }
+        }
+        stage('Deployment Approval') {
+            when {
+                // 커밋 메시지에 "rollback"이 포함되어 있지 않을 때만 실행
+                expression { 
+                    def commitMessage = sh(script: 'git log --format=%B -n 1', returnStdout: true).trim().toLowerCase()
+                    return !commitMessage.contains('rollback')
+                }
+            }
+            steps {
+                script {
+                    def envType = env.BRANCH_NAME == 'main' ? '/^prod-.*/' :
+                                  env.BRANCH_NAME == 'stg' ? '/^stg-.*/' :
+                                  env.BRANCH_NAME == 'dev' ? '/^dev-.*/' :
+                                  env.BRANCH_NAME == 'feature' ? '/^feature-.*/' : 
+                                  'Unknown'
+                    
+                    def approverId = input(message: "Deployment approved to ${envType}. Enter your name:", parameters: [string(defaultValue: '', description: 'Your Name', name: 'name')])
+
+                    echo "Deployment approved to ${envType} by ${approverId}."
+                }
+            }
+        }
+        stage('Deploy or Rollback') {
+            when {
+                // "Deploy or Rollback" 스테이지는 항상 실행
+                expression { true }
+            }
+            steps {
+                script {
+                    def userInput = input(
+                        message: 'Select Action: Deploy or Rollback?',
+                        parameters: [choice(
+                            name: 'ACTION',
+                            choices: ['Deploy', 'Rollback'],
+                            description: 'Select Deployment Action'
+                        )]
+                    )
+                    def action = userInput
+
+                    echo "action ${action}"
+
+                    if (action == 'Deploy') {
+                        // Deploy 작업을 위한 처리
+                        def targetInstanceGroup
+                        def updateVersion
+
+                        if (env.BRANCH_NAME == 'main' || env.GIT_TAG ==~ /^prod-.*/) {
+                            echo "Deploying to production..."
+                            targetInstanceGroup = PROD_INSTANCE_GROUP_NAME
+                        } else if (env.BRANCH_NAME == 'stg' || env.GIT_TAG ==~ /^stg-.*/) {
+                            echo "Deploying to staging..."
+                            targetInstanceGroup = STG_INSTANCE_GROUP_NAME
+                        } else if (env.BRANCH_NAME == 'dev' || env.GIT_TAG ==~ /^dev-.*/) {
+                            echo "Deploying to Development...."
+                            targetInstanceGroup = DEV_INSTANCE_GROUP_NAME
+                        } else {
+                            error("Unsupported branch or tag: ${env.BRANCH_NAME} / ${env.GIT_TAG}")
+                            currentBuild.result = 'FAILURE'
+                            return
+                        }
+
+                        try {
+                            updateVersion = getLatestTemplateVersion()
+                            echo "Version Rolling Update.... version : $updateVersion"
+                            gcloudConfigSetProject(env.PROJECT_ID)
+                            startManagedInstanceGroupUpdate(targetInstanceGroup, updateVersion)
+                        } catch (Exception e) {
+                            currentBuild.result = 'FAILURE'
+                            error("Build failed: ${e.getMessage()}")
+                        }
+                    } else if (action == 'Rollback') {
+                        // Rollback 작업을 위한 처리
+                        def selectedVersion 
+                        def targetInstanceGroup
+
+                        if (env.BRANCH_NAME == 'main' || env.GIT_TAG ==~ /^prod-.*/) {
+                            echo "Rolling back to production..."
+                            targetInstanceGroup = PROD_INSTANCE_GROUP_NAME
+                        } else if (env.BRANCH_NAME == 'stg' || env.GIT_TAG ==~ /^stg-.*/) {
+                            echo "Rolling back to staging..."
+                            targetInstanceGroup = STG_INSTANCE_GROUP_NAME
+                        } else if (env.BRANCH_NAME == 'dev' || env.GIT_TAG ==~ /^dev-.*/) {
+                            echo "Rolling back to Development...."
+                            targetInstanceGroup = DEV_INSTANCE_GROUP_NAME
+                        } else {
+                            error("Unsupported branch or tag: ${env.BRANCH_NAME} / ${env.GIT_TAG}")
+                            currentBuild.result = 'FAILURE'
+                            return
+                        }
+
+                        try {
+                            selectedVersion = getRollbackVersion()
+                            echo "Rolling Backup.... version : ${selectedVersion}"
+                            gcloudConfigSetProject(env.PROJECT_ID)
+                            startManagedInstanceGroupUpdate(targetInstanceGroup, selectedVersion)
+                        } catch (Exception e) {
+                            currentBuild.result = 'FAILURE'
+                            error("Build failed: ${e.getMessage()}")
+                        }
+                    }                
+                }
+            }   
+        }
+    }
+post { 
+    always {
+        script {
+            def isFailure = currentBuild.resultIsBetterOrEqualTo('FAILURE')
+            def status = isFailure ? 'Failed' : 'Succeeded'
+            def message = "Pipeline ${status}: ${currentBuild.currentResult}"
+            sendTeamsNotification(message, isFailure)
+            }
+        }
+    }
+}
+
+def getLatestTemplateVersion() {
+    def templateListCommand = """
+        gcloud compute instance-templates list \
+        --filter="name=${DEV_PROJECT_NAME}" \
+        --sort-by="creationTimestamp" \
+        | tail -1f \
+        | awk '{print \$1}'
+    """    
+    def latestVersion = sh(script: templateListCommand, returnStdout: true).trim()
+    return latestVersion
+}
+
+def getRollbackVersion() {
+    def templateListCommand = """
+        gcloud compute instance-templates list \
+        --filter="name=${DEV_PROJECT_NAME}" \
+        --sort-by="creationTimestamp" \
+        | tail -3f \
+        | awk '{print \$1}'
+    """
+    def rollbackVersion = sh(script: templateListCommand, returnStdout: true).trim()
+    def versionArray = rollbackVersion.split('\n')
+
+    // 선택 옵션 생성
+    def versionChoices = [:]
+    versionArray.eachWithIndex { version, index ->
+        versionChoices["Version ${index + 1}"] = version
+    }
+
+    if (versionChoices.isEmpty()) {
+        error("No versions found. Exiting.")
+        currentBuild.result = 'FAILURE'
+        return
+    }
+
+    // input() 메서드를 호출하여 사용자로부터 선택을 받습니다.
+    def userInput = input(
+        id: 'VERSION_SELECTION',
+        message: 'Select a version to rollback:',
+        parameters: [
+            choice(
+                name: 'SELECTED_VERSION',
+                choices: versionChoices.collect { k, v -> v }, // SELECTED_VERSION을 그대로 사용
+                description: 'Select a version'
+            )
+        ],
+        submitter: 'Rollback'
+    )
+
+    // 선택된 버전을 변수로 설정하고 반환
+    def selectedVersion = userInput
+    return selectedVersion
+}
+
+def handleSelectedVersion(version, selectedVersion) {
+    // 선택된 버전을 처리하는 작업을 수행합니다.
+    // 이 함수에서 필요한 작업을 수행하고 결과를 반환합니다.
+    // 예: 선택된 버전을 이용한 후속 작업 수행
+    return version
+}
+
+// 모든 작업이 완료될 때까지 대기하는 함수
+def waitForAllResults(results) {
+    for (entry in results) {
+        def version = entry.key
+        def result = entry.value
+        echo "Result for ${version}: ${result}"
+        // 여기서 result를 사용하여 추가 작업 수행 가능
+    }
+}
+def gcloudConfigSetProject(projectId) {
+    sh "gcloud config set project ${projectId}"
+}
+
+def startManagedInstanceGroupUpdate(instanceGroupName, version) {
+    def gcloudCommand = """
+        time gcloud beta compute instance-groups managed rolling-action start-update ${instanceGroupName} \\
+        --version template=${version} --region=${env.REGION} --project ${env.PROJECT_ID} \\
+        --type proactive --max-surge 3 --max-unavailable 0
+    """
+    sh "${gcloudCommand}"
+}
+
+def sendTeamsNotification(message, isFailure) {
+    def teamsWebhookUrl = 'TEAMS_WEBHOOK_URL'
+    
+    script {
+        def pipelineUrl = env.BUILD_URL
+        def pipelineNumber = env.BUILD_NUMBER
+        def pipelineBranch = env.BRANCH_NAME
+        def pipelineAuthor = sh(script: 'git log -1 --pretty=format:%an', returnStdout: true).trim()
+        def activityImage = isFailure ? "https://www.jenkins.io/images/logos/fire/fire.png" : "https://www.jenkins.io/images/logos/plumber/plumber.png"
+        def themeColor = isFailure ? 'FF0000' : '00FF00'  // Red OR Green
+        def payload = [
+            themeColor: themeColor,
+            text: "Jenkins Pipeline Status: ${message}",
+            sections: [
+                [
+                    activityTitle: "Pipeline Details",
+                    activitySubtitle: "Pipeline #${pipelineNumber} on ${pipelineBranch}",
+                    activityImage: activityImage,
+                    facts: [
+                        [name: "Status", value: message],
+                        [name: "Author", value: pipelineAuthor],
+                        [name: "Pipeline URL", value: pipelineUrl],
+                        [name: "Pipeline BRANCH", value: pipelineBranch]
+                    ]
+                ]
+            ]
+        ]
+        
+        def response = httpRequest(
+            acceptType: 'APPLICATION_JSON',
+            contentType: 'APPLICATION_JSON',
+            customHeaders: [[name: 'Authorization', value: "Bearer $teamsWebhookUrl"]],
+            httpMode: 'POST',
+            requestBody: groovy.json.JsonOutput.toJson(payload),
+            url: teamsWebhookUrl
+        )
+        
+        if (response.status != 200) {
+            echo "Failed to send Teams notification: ${response.status}"
+        } else {
+            echo "Teams notification sent successfully!"
+        }
+    }
+}
+
+def sendTeamsApprovalAndProcess(message) {
+    def teamsWebhookUrl = 'TEAMS_WEBHOOK_URL'
+    
+    script {
+        def pipelineUrl = env.BUILD_URL
+        def pipelineNumber = env.BUILD_NUMBER
+        def pipelineAuthor = sh(script: 'git log -1 --pretty=format:%an', returnStdout: true).trim()
+        def activityImage = "https://www.jenkins.io/images/logos/actor/actor.png"
+        def themeColor = '#800080'
+        def payload = [
+            themeColor: themeColor,
+            text: "Deployment Notification: ${message}",
+            sections: [
+                [
+                    activityTitle: "Deployment Notification",
+                    activitySubtitle: "Pipeline #${pipelineNumber}",
+                    activityImage: activityImage,
+                    facts: [
+                        [name: "Message", value: message],
+                        [name: "Author", value: pipelineAuthor],
+                        [name: "Deployment URL", value: pipelineUrl],
+                    ]
+                ]
+            ]
+        ]
+        
+        def response = httpRequest(
+            acceptType: 'APPLICATION_JSON',
+            contentType: 'APPLICATION_JSON',
+            customHeaders: [[name: 'Authorization', value: "Bearer $teamsWebhookUrl"]],
+            httpMode: 'POST',
+            requestBody: groovy.json.JsonOutput.toJson(payload),
+            url: teamsWebhookUrl
+        )
+        
+        if (response.status != 200) {
+            echo "Failed to send Teams notification: ${response.status}"
+        } else {
+            echo "Teams notification sent successfully!"
+        }
+    }
+}
