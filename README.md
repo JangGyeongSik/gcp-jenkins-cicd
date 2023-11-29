@@ -1,5 +1,5 @@
 # gcp-jenkins-cicd
-<h3>VM Deploy Guild with Jeknins CI/CD</h3> 
+<h3>VM Deploy Guide with Jeknins CI/CD</h3> 
 
 # Reference
 * #### [GCP VM Deploy Guide with Jenkins CI/CD - 1](https://stancloud.blogspot.com/2023/09/cicd-gcp-vm-deploy-guide-with-jenkins-001.html)
